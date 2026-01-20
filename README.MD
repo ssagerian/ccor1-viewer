@@ -18,6 +18,7 @@ Designed for:
   - Running difference
 - Adjustable playback FPS
 - Cached PNG frames for smooth viewing
+![CCOR-1 Viewer GUI](screenshots/ccor1_main.png)
 
 ## Data Source
 Public NOAA S3 bucket:
