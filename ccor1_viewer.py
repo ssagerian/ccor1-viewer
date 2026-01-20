@@ -27,9 +27,9 @@ S3_BASE = f"https://{BUCKET}.s3.amazonaws.com"
 
 # You can change this if NOAA moves folders. This is the only thing you may need to edit.
 # Start with the most likely L1B layout (time-based folders).
-DEFAULT_PREFIX = "SWFO/GOES-19/CCOR-1/ccor1-l1b/"
+DEFAULT_PREFIX = "SWFO/GOES-19/CCOR-1/ccor1-l3/"
 
-TS_RE = re.compile(r"CCOR1_(?:1B|L1B)_(\d{8}T\d{6}).*\.fits$", re.IGNORECASE)
+TS_RE = re.compile(r"CCOR1_[1-9]_(\d{8}T\d{6})_.*\.fits$", re.IGNORECASE)
 
 @dataclass
 @dataclass
