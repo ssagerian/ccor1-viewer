@@ -1,0 +1,6 @@
+numpy
+requests
+astropy
+pillow
+opencv-python
+tkcalendar
