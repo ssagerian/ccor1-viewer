@@ -10,7 +10,7 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from tkcalendar import DateEntry
-
+import inspect
 import requests
 import numpy as np
 from astropy.io import fits
@@ -27,9 +27,13 @@ S3_BASE = f"https://{BUCKET}.s3.amazonaws.com"
 
 # You can change this if NOAA moves folders. This is the only thing you may need to edit.
 # Start with the most likely L1B layout (time-based folders).
-DEFAULT_PREFIX = "SWFO/GOES-19/CCOR-1/ccor1-l3/"
+DEFAULT_PREFIX = "SWFO/GOES-19/CCOR-1/ccor1-l2/"
 
-TS_RE = re.compile(r"CCOR1_[1-9]_(\d{8}T\d{6})_.*\.fits$", re.IGNORECASE)
+TS_RE = re.compile(
+    r"CCOR1_(?:[1-9]B?)_(\d{8}T\d{6})_.*\.fits$",
+    re.IGNORECASE
+)
+
 
 @dataclass
 @dataclass
@@ -331,6 +335,12 @@ class Viewer(tk.Toplevel):
         self.idx = 0
         self.playing = False
         self.fps = tk.IntVar(value=fps_default)
+        self._disp_w, self._disp_h = 0, 0
+        self._orig_w, self._orig_h = 0, 0
+        self._offset_x = 0
+        self._offset_y = 0
+        self._scale = 1.0
+        self.picks = []  # list of dicts
 
         # UI
         top = ttk.Frame(self)
@@ -345,11 +355,13 @@ class Viewer(tk.Toplevel):
 
         ttk.Label(top, text="FPS:").pack(side=tk.LEFT, padx=(16, 4))
         ttk.Spinbox(top, from_=1, to=60, textvariable=self.fps, width=5).pack(side=tk.LEFT)
+        ttk.Button(top, text="Track →", command=self.track_forward_prompt).pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Button(top, text="Export CSV", command=self.export_picks_csv).pack(side=tk.LEFT, padx=4)
 
         self.info = ttk.Label(top, text="")
         self.info.pack(side=tk.LEFT, padx=16)
 
-        self.canvas = tk.Canvas(self, bg="black")
+        self.canvas = tk.Canvas(self, bg="navy")
         self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         self._tk_img = None
@@ -357,8 +369,204 @@ class Viewer(tk.Toplevel):
         self.bind("<Right>", lambda e: self.step(+1))
         self.bind("<space>", lambda e: self.toggle_play())
 
+        self.canvas.bind("<Button-1>", self.on_click)
+        self._last_pick = None
+
         self.update_idletasks()
         self.show_frame(0)
+
+    # def on_click(self, event):
+    #     # event.x, event.y are canvas coords
+    #     cx, cy = event.x, event.y
+    #
+    #     # Check if click is inside displayed image bounds
+    #     if not hasattr(self, "_offset_x"):
+    #         return
+    #
+    #     if not (self._offset_x <= cx < self._offset_x + self._disp_w and
+    #             self._offset_y <= cy < self._offset_y + self._disp_h):
+    #         return  # clicked in black border
+    #
+    #     # Convert canvas -> displayed-image coords
+    #     dx = cx - self._offset_x
+    #     dy = cy - self._offset_y
+    #
+    #     # Convert displayed -> original image coords
+    #     # scale = displayed/original, so original = displayed/scale
+    #     x = int(dx / self._scale)
+    #     y = int(dy / self._scale)
+    #
+    #     # Clamp to image bounds
+    #     x = max(0, min(x, self._orig_w - 1))
+    #     y = max(0, min(y, self._orig_h - 1))
+    #     rx, ry = self.refine_centroid_from_png(x, y, half=20)
+    #     self._last_click = (rx, ry)
+    #     self.info.config(text=f"... x={rx} y={ry}")
+    #
+    #     # Display in the UI (add a label or log)
+    #     self.info.config(
+    #         text=f"{self.idx + 1}/{len(self.frames)}   {self.frames[self.idx]['date_obs_utc']}   x={x} y={y}")
+    #
+    #     self.picks.append({
+    #         "frame": self.idx,
+    #         "timestamp": self.frames[self.idx].get("date_obs_utc", ""),
+    #         "x": int(rx if ok else x),
+    #         "y": int(ry if ok else y),
+    #         "method": "centroid" if ok else "click",
+    #     })
+    #     print(self.picks[-1])
+    #
+    #     # Optional: draw a small marker crosshair
+    #     self._draw_marker(dx, dy)
+
+    def load_png_gray(self, frame_idx: int):
+        path = self.frames[frame_idx]["png"]
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise RuntimeError(f"Failed to load PNG: {path}")
+        return img
+
+    def find_centroid_near(self, img_gray: np.ndarray, x: int, y: int, search: int = 30, half: int = 20):
+        """
+        Search around (x,y) within +-search pixels. For each candidate position, we
+        compute a centroid in a small ROI (half) and score it by mask area (m00).
+        Returns (best_x, best_y, ok).
+        """
+        h, w = img_gray.shape
+        best = None  # (score, cx, cy)
+
+        # Limit search window
+        x_min = max(0, x - search)
+        x_max = min(w - 1, x + search)
+        y_min = max(0, y - search)
+        y_max = min(h - 1, y + search)
+
+        # Strategy: evaluate a coarse grid first (speed), then refine around best
+        step = 3  # coarse step; adjust if needed
+
+        def centroid_and_score_at(px, py):
+            x0 = max(0, px - half);
+            x1 = min(w, px + half + 1)
+            y0 = max(0, py - half);
+            y1 = min(h, py + half + 1)
+            roi = img_gray[y0:y1, x0:x1]
+            if roi.size == 0:
+                return None
+
+            roi_blur = cv2.GaussianBlur(roi, (3, 3), 0)
+            _, mask = cv2.threshold(roi_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            m = cv2.moments(mask)
+            if m["m00"] == 0:
+                return None
+
+            cx = int(m["m10"] / m["m00"])
+            cy = int(m["m01"] / m["m00"])
+            # Score: area (m00) — larger blob wins; you can change to sum of intensities if preferred
+            score = m["m00"]
+            return score, (x0 + cx), (y0 + cy)
+
+        # Coarse scan
+        for yy in range(y_min, y_max + 1, step):
+            for xx in range(x_min, x_max + 1, step):
+                res = centroid_and_score_at(xx, yy)
+                if res is None:
+                    continue
+                score, cx, cy = res
+                if best is None or score > best[0]:
+                    best = (score, cx, cy)
+
+        if best is None:
+            return x, y, False
+
+        # Refine scan around best centroid with step=1 in a small neighborhood
+        _, bx, by = best
+        refine = 6
+        best2 = best
+        for yy in range(max(0, by - refine), min(h - 1, by + refine) + 1):
+            for xx in range(max(0, bx - refine), min(w - 1, bx + refine) + 1):
+                res = centroid_and_score_at(xx, yy)
+                if res is None:
+                    continue
+                score, cx, cy = res
+                if score > best2[0]:
+                    best2 = (score, cx, cy)
+
+        return best2[1], best2[2], True
+
+    def track_forward_prompt(self):
+        if not hasattr(self, "_last_pick") or self._last_pick is None:
+            messagebox.showinfo("Track", "Click on the object first to set the starting position.")
+            return
+
+        # Simple prompt via small popup
+        win = tk.Toplevel(self)
+        win.title("Track forward")
+        win.resizable(False, False)
+
+        ttk.Label(win, text="Frames to track:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        nvar = tk.IntVar(value=30)
+        ttk.Spinbox(win, from_=1, to=500, textvariable=nvar, width=7).grid(row=0, column=1, padx=10, pady=10)
+
+        ttk.Label(win, text="Search radius (px/frame):").grid(row=1, column=0, padx=10, pady=10, sticky="w")
+        svar = tk.IntVar(value=30)
+        ttk.Spinbox(win, from_=5, to=200, textvariable=svar, width=7).grid(row=1, column=1, padx=10, pady=10)
+
+        def go():
+            win.destroy()
+            self.track_forward(n_frames=int(nvar.get()), search=int(svar.get()))
+
+        ttk.Button(win, text="Start", command=go).grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 10))
+
+    def track_forward(self, n_frames: int = 30, search: int = 30):
+        x, y = self._last_pick
+        start_idx = self.idx
+        end_idx = min(len(self.frames) - 1, start_idx + n_frames)
+
+        self._log_pick(start_idx, x, y, method="seed")
+
+        for j in range(start_idx + 1, end_idx + 1):
+            img = self.load_png_gray(j)
+            nx, ny, ok = self.find_centroid_near(img, x, y, search=search, half=20)
+
+            ts = self.frames[j].get("date_obs_utc", "")
+            if not ok:
+                self.info.config(text=f"{j + 1}/{len(self.frames)}  {ts}  TRACK LOST near ({x},{y})")
+                break
+
+            x, y = nx, ny
+            self._log_pick(j, x, y, method="track")
+
+        # Update last pick and show last tracked frame
+        self._last_pick = (x, y)
+        self.show_frame(min(end_idx, j))
+
+    def _log_pick(self, frame_idx: int, x: int, y: int, method: str):
+        ts = self.frames[frame_idx].get("date_obs_utc", "")
+        rec = {"frame": frame_idx, "timestamp": ts, "x": int(x), "y": int(y), "method": method}
+        self.picks.append(rec)
+        #print(rec)  # optional
+
+    def export_picks_csv(self):
+        if not self.picks:
+            messagebox.showinfo("Export", "No picks to export yet.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save picks CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        import csv
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["frame", "timestamp", "x", "y", "method"])
+            w.writeheader()
+            w.writerows(self.picks)
+
+        messagebox.showinfo("Export", f"Saved: {path}")
 
     def show_frame(self, idx: int):
         idx = max(0, min(idx, len(self.frames) - 1))
@@ -375,14 +583,165 @@ class Viewer(tk.Toplevel):
         iw, ih = img.size
         scale = min(cw / iw, ch / ih)
         nw, nh = int(iw * scale), int(ih * scale)
+        # Save geometry for coordinate mapping
+        self._orig_w, self._orig_h = iw, ih  # original PNG size
+        self._disp_w, self._disp_h = nw, nh  # displayed size on canvas
+        self._scale = scale  # displayed/original
+        self._offset_x = (cw - nw) // 2  # top-left of displayed image on canvas
+        self._offset_y = (ch - nh) // 2
+
         img2 = img.resize((nw, nh), Image.BILINEAR)
 
         self._tk_img = ImageTk.PhotoImage(img2, master=self)
         self.canvas.delete("all")
-        self.canvas.create_image(cw // 2, ch // 2, image=self._tk_img)
+        self.canvas.create_image(self._offset_x, self._offset_y, anchor="nw", image=self._tk_img)
 
         ts = item["date_obs_utc"]
         self.info.config(text=f"{self.idx+1}/{len(self.frames)}   {ts}")
+
+    def canvas_to_image_xy(self, cx: int, cy: int):
+        """Map canvas coords to original PNG pixel coords (x,y). Returns None if outside image."""
+        if not hasattr(self, "_offset_x"):
+            return None
+
+        # Inside the displayed image?
+        if not (self._offset_x <= cx < self._offset_x + self._disp_w and
+                self._offset_y <= cy < self._offset_y + self._disp_h):
+            return None
+
+        dx = cx - self._offset_x
+        dy = cy - self._offset_y
+
+        # displayed -> original (top-left origin)
+        x = int(dx / self._scale)
+        y = int(dy / self._scale)
+
+        x = max(0, min(x, self._orig_w - 1))
+        y = max(0, min(y, self._orig_h - 1))
+        return x, y
+
+    def refine_centroid_from_png(self, x: int, y: int, half: int = 20):
+        """
+        Shape-based refinement: centroid of a bright blob near (x,y) in processed PNG.
+        Returns (rx, ry, ok).
+        """
+        print("DEBUG: refine_centroid_from_png returning 3 values")
+        path = self.frames[self.idx]["png"]
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return x, y, False
+
+        h, w = img.shape
+        x0 = max(0, x - half);
+        x1 = min(w, x + half + 1)
+        y0 = max(0, y - half);
+        y1 = min(h, y + half + 1)
+
+        roi = img[y0:y1, x0:x1]
+        if roi.size == 0:
+            return x, y, False
+
+        roi_blur = cv2.GaussianBlur(roi, (3, 3), 0)
+        _, mask = cv2.threshold(
+            roi_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+
+        m = cv2.moments(mask)
+        if m["m00"] == 0:
+            return x, y, False
+
+        cx = int(m["m10"] / m["m00"])
+        cy = int(m["m01"] / m["m00"])
+        return x0 + cx, y0 + cy, True
+
+    def draw_pick_overlay(self, x: int, y: int, half: int = 20):
+        """
+        Draw a crosshair at (x,y) in original coords and a ROI box of size (2*half+1).
+        """
+        # Convert original coords -> displayed coords
+        dx = int(x * self._scale)
+        dy = int(y * self._scale)
+
+        cx = self._offset_x + dx
+        cy = self._offset_y + dy
+
+        # ROI box in displayed coords
+        r = int(half * self._scale)
+        x0 = cx - r;
+        y0 = cy - r
+        x1 = cx + r;
+        y1 = cy + r
+
+        self.canvas.delete("pick")
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="yellow", width=2, tags="pick")
+        self.canvas.create_line(cx - 8, cy, cx + 8, cy, fill="yellow", width=2, tags="pick")
+        self.canvas.create_line(cx, cy - 8, cx, cy + 8, fill="yellow", width=2, tags="pick")
+
+    def on_click(self, event):
+        mapped = self.canvas_to_image_xy(event.x, event.y)
+        if mapped is None:
+            return
+
+        x, y = mapped
+
+        print("DEBUG refine fn:", inspect.getsourcefile(self.refine_centroid_from_png),
+              inspect.getsourcelines(self.refine_centroid_from_png)[1])
+
+        res = self.refine_centroid_from_png(x, y, half=20)
+        if isinstance(res, tuple) and len(res) == 3:
+            rx, ry, ok = res
+        elif isinstance(res, tuple) and len(res) == 2:
+            rx, ry = res
+            ok = True  # or False if you want to indicate "unverified centroid"
+        else:
+            raise RuntimeError(f"Unexpected refine_centroid_from_png return: {res!r}")
+
+        self._last_pick = (rx, ry) if ok else (x, y)
+
+        ts = self.frames[self.idx].get("date_obs_utc", "")
+        if ok:
+            self.info.config(text=f"{self.idx + 1}/{len(self.frames)}  {ts}  click=({x},{y})  centroid=({rx},{ry})")
+        else:
+            self.info.config(text=f"{self.idx + 1}/{len(self.frames)}  {ts}  click=({x},{y})  centroid=(n/a)")
+
+        # Draw overlay at refined location (or click if no centroid)
+        self.draw_pick_overlay(rx if ok else x, ry if ok else y, half=20)
+
+    def _draw_marker(self, dx, dy):
+        # dx,dy are displayed-image coords (not canvas)
+        cx = self._offset_x + dx
+        cy = self._offset_y + dy
+        r = 6
+        self.canvas.delete("marker")
+        self.canvas.create_line(cx - r, cy, cx + r, cy, fill="yellow", tags="marker")
+        self.canvas.create_line(cx, cy - r, cx, cy + r, fill="yellow", tags="marker")
+
+    # def refine_centroid_from_png(self, x, y, half=20):
+    #     # x,y in original coords
+    #     path = self.frames[self.idx]["png"]
+    #     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    #     if img is None:
+    #         return x, y
+    #
+    #     h, w = img.shape
+    #     x0 = max(0, x - half);
+    #     x1 = min(w, x + half + 1)
+    #     y0 = max(0, y - half);
+    #     y1 = min(h, y + half + 1)
+    #     roi = img[y0:y1, x0:x1]
+    #
+    #     # Suppress noise and threshold
+    #     roi_blur = cv2.GaussianBlur(roi, (3, 3), 0)
+    #     _, mask = cv2.threshold(roi_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    #
+    #     m = cv2.moments(mask)
+    #     if m["m00"] == 0:
+    #         return x, y  # no blob found
+    #
+    #     cx = int(m["m10"] / m["m00"])
+    #     cy = int(m["m01"] / m["m00"])
+    #
+    #     return (x0 + cx, y0 + cy)
 
     def step(self, delta: int):
         self.show_frame(self.idx + delta)
