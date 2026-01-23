@@ -14,7 +14,7 @@ import inspect
 import requests
 import numpy as np
 from astropy.io import fits
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageOps
 import cv2
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -357,6 +357,8 @@ class Viewer(tk.Toplevel):
         ttk.Spinbox(top, from_=1, to=60, textvariable=self.fps, width=5).pack(side=tk.LEFT)
         ttk.Button(top, text="Track →", command=self.track_forward_prompt).pack(side=tk.LEFT, padx=(12, 4))
         ttk.Button(top, text="Export CSV", command=self.export_picks_csv).pack(side=tk.LEFT, padx=4)
+        self.mouse_info = ttk.Label(top, text="x=—  y=—")
+        self.mouse_info.pack(side=tk.LEFT, padx=8)
 
         self.info = ttk.Label(top, text="")
         self.info.pack(side=tk.LEFT, padx=16)
@@ -370,6 +372,8 @@ class Viewer(tk.Toplevel):
         self.bind("<space>", lambda e: self.toggle_play())
 
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Motion>", self.on_motion)
+
         self._last_pick = None
 
         self.update_idletasks()
@@ -424,6 +428,7 @@ class Viewer(tk.Toplevel):
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise RuntimeError(f"Failed to load PNG: {path}")
+        img = cv2.flip(img, 0)
         return img
 
     def find_centroid_near(self, img_gray: np.ndarray, x: int, y: int, search: int = 30, half: int = 20):
@@ -574,6 +579,8 @@ class Viewer(tk.Toplevel):
         item = self.frames[self.idx]
 
         img = Image.open(item["png"])
+        img = ImageOps.flip(img)  # vertical flip (top-bottom)
+
         # Fit-to-window preserving aspect ratio
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
@@ -595,6 +602,7 @@ class Viewer(tk.Toplevel):
         self._tk_img = ImageTk.PhotoImage(img2, master=self)
         self.canvas.delete("all")
         self.canvas.create_image(self._offset_x, self._offset_y, anchor="nw", image=self._tk_img)
+        self.draw_grid(step_pct=0.15)
 
         ts = item["date_obs_utc"]
         self.info.config(text=f"{self.idx+1}/{len(self.frames)}   {ts}")
@@ -625,11 +633,12 @@ class Viewer(tk.Toplevel):
         Shape-based refinement: centroid of a bright blob near (x,y) in processed PNG.
         Returns (rx, ry, ok).
         """
-        print("DEBUG: refine_centroid_from_png returning 3 values")
+        #print("DEBUG: refine_centroid_from_png returning 3 values")
         path = self.frames[self.idx]["png"]
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             return x, y, False
+        img = cv2.flip(img, 0)  # vertical flip to match display
 
         h, w = img.shape
         x0 = max(0, x - half);
@@ -707,6 +716,14 @@ class Viewer(tk.Toplevel):
         # Draw overlay at refined location (or click if no centroid)
         self.draw_pick_overlay(rx if ok else x, ry if ok else y, half=20)
 
+    def on_motion(self, event):
+        mapped = self.canvas_to_image_xy(event.x, event.y)
+        if mapped is None:
+            self.mouse_info.config(text="x=—  y=—")
+            return
+        x, y = mapped
+        self.mouse_info.config(text=f"x={x}  y={y}")
+
     def _draw_marker(self, dx, dy):
         # dx,dy are displayed-image coords (not canvas)
         cx = self._offset_x + dx
@@ -715,6 +732,40 @@ class Viewer(tk.Toplevel):
         self.canvas.delete("marker")
         self.canvas.create_line(cx - r, cy, cx + r, cy, fill="yellow", tags="marker")
         self.canvas.create_line(cx, cy - r, cx, cy + r, fill="yellow", tags="marker")
+
+    def draw_grid(self, step_pct: float = 0.15):
+        """
+        Draw major grid lines every step_pct of original image width/height.
+        Grid is drawn in canvas coords, scaled/offset to match the displayed image.
+        """
+        if self._scale <= 0:
+            return
+
+        self.canvas.delete("grid")
+
+        # Percent positions: 15%, 30%, ... 90%
+        n = int(1.0 / step_pct)
+        pcts = [step_pct * i for i in range(1, n)]  # exclude 0% and 100%
+
+        # Draw vertical lines
+        for p in pcts:
+            x_img = p * (self._orig_w - 1)  # in original pixel coords
+            x_can = self._offset_x + int(x_img * self._scale)
+            self.canvas.create_line(
+                x_can, self._offset_y,
+                x_can, self._offset_y + self._disp_h,
+                fill="lightcyan", width=1, tags="grid"
+            )
+
+        # Draw horizontal lines
+        for p in pcts:
+            y_img = p * (self._orig_h - 1)
+            y_can = self._offset_y + int(y_img * self._scale)
+            self.canvas.create_line(
+                self._offset_x, y_can,
+                self._offset_x + self._disp_w, y_can,
+                fill="lightcyan", width=1, tags="grid"
+            )
 
     # def refine_centroid_from_png(self, x, y, half=20):
     #     # x,y in original coords
