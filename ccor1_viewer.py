@@ -34,6 +34,12 @@ TS_RE = re.compile(
     re.IGNORECASE
 )
 
+MODES = [
+    "none",
+    "spatial",
+    "temporal",
+    "runningdiff",
+]
 
 @dataclass
 @dataclass
@@ -193,6 +199,7 @@ def read_ccor1_l1b_image(fits_path: str) -> Tuple[np.ndarray, dt.datetime]:
 # ----------------------------
 # Processing modes (comet-friendly options)
 # ----------------------------
+
 def enhance_stack_temporal_median(stack: np.ndarray, idx: int, window: int = 2) -> np.ndarray:
     """
     Your original idea: temporal median background subtraction (good for CMEs; mixed for comets).
@@ -326,7 +333,7 @@ def process_to_frames(
 # Tkinter Viewer
 # ----------------------------
 class Viewer(tk.Toplevel):
-    def __init__(self, master, frames: List[dict], fps_default: int = 10):
+    def __init__(self, master, frames: List[dict], fps_default: int = 10, reg_var=None):
         super().__init__(master)
         self.title("CCOR-1 Viewer (PNG cache)")
         self.geometry("1100x800")
@@ -341,6 +348,7 @@ class Viewer(tk.Toplevel):
         self._offset_y = 0
         self._scale = 1.0
         self.picks = []  # list of dicts
+        self.reg_var = reg_var
 
         # UI
         top = ttk.Frame(self)
@@ -379,56 +387,11 @@ class Viewer(tk.Toplevel):
         self.update_idletasks()
         self.show_frame(0)
 
-    # def on_click(self, event):
-    #     # event.x, event.y are canvas coords
-    #     cx, cy = event.x, event.y
-    #
-    #     # Check if click is inside displayed image bounds
-    #     if not hasattr(self, "_offset_x"):
-    #         return
-    #
-    #     if not (self._offset_x <= cx < self._offset_x + self._disp_w and
-    #             self._offset_y <= cy < self._offset_y + self._disp_h):
-    #         return  # clicked in black border
-    #
-    #     # Convert canvas -> displayed-image coords
-    #     dx = cx - self._offset_x
-    #     dy = cy - self._offset_y
-    #
-    #     # Convert displayed -> original image coords
-    #     # scale = displayed/original, so original = displayed/scale
-    #     x = int(dx / self._scale)
-    #     y = int(dy / self._scale)
-    #
-    #     # Clamp to image bounds
-    #     x = max(0, min(x, self._orig_w - 1))
-    #     y = max(0, min(y, self._orig_h - 1))
-    #     rx, ry = self.refine_centroid_from_png(x, y, half=20)
-    #     self._last_click = (rx, ry)
-    #     self.info.config(text=f"... x={rx} y={ry}")
-    #
-    #     # Display in the UI (add a label or log)
-    #     self.info.config(
-    #         text=f"{self.idx + 1}/{len(self.frames)}   {self.frames[self.idx]['date_obs_utc']}   x={x} y={y}")
-    #
-    #     self.picks.append({
-    #         "frame": self.idx,
-    #         "timestamp": self.frames[self.idx].get("date_obs_utc", ""),
-    #         "x": int(rx if ok else x),
-    #         "y": int(ry if ok else y),
-    #         "method": "centroid" if ok else "click",
-    #     })
-    #     print(self.picks[-1])
-    #
-    #     # Optional: draw a small marker crosshair
-    #     self._draw_marker(dx, dy)
-
     def load_png_gray(self, frame_idx: int):
         path = self.frames[frame_idx]["png"]
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise RuntimeError(f"Failed to load PNG: {path}")
-        img = cv2.flip(img, 0)
         return img
 
     def find_centroid_near(self, img_gray: np.ndarray, x: int, y: int, search: int = 30, half: int = 20):
@@ -573,12 +536,86 @@ class Viewer(tk.Toplevel):
 
         messagebox.showinfo("Export", f"Saved: {path}")
 
+    def _prep_for_reg(self, img_u8: np.ndarray) -> np.ndarray:
+        x = img_u8.astype(np.float32)
+        bg = cv2.GaussianBlur(x, (0, 0), 20)
+        hp = x - bg
+        hp = np.clip(hp, 0, None)
+        hp = cv2.normalize(hp, None, 0, 1, cv2.NORM_MINMAX)
+        return hp.astype(np.float32)
+
+    def _align_to_prev(self, prev_u8: np.ndarray, cur_u8: np.ndarray):
+        prev = self._prep_for_reg(prev_u8)
+        cur = self._prep_for_reg(cur_u8)
+
+        hann = cv2.createHanningWindow((prev.shape[1], prev.shape[0]), cv2.CV_32F)
+        (dx, dy), response = cv2.phaseCorrelate(prev * hann, cur * hann)
+
+        # Guard rails: phaseCorrelate can return nonsense (e.g. W/2,H/2) when it fails.
+        h, w = cur_u8.shape[:2]
+
+        # "Too big to be real" threshold; tune as needed
+        max_shift = min(w, h) * 0.10  # 10% of smallest dimension (~192 px here)
+
+        if (response < 0.2) or (abs(dx) > max_shift) or (abs(dy) > max_shift):
+            # Skip alignment; return original
+            return cur_u8, (dx, dy), response
+
+        # Sign: phaseCorrelate(prev, cur) gives the shift to apply to cur to match prev.
+        M = np.array([[1, 0, -dx],
+                      [0, 1, -dy]], dtype=np.float32)
+
+        aligned = cv2.warpAffine(
+            cur_u8, M,
+            (w, h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_REFLECT
+        )
+        return aligned, (dx, dy), response
+
+    def _running_diff_display(self, prev_u8, cur_aligned_u8):
+        prev2 = cv2.GaussianBlur(prev_u8, (3, 3), 0)
+        cur2 = cv2.GaussianBlur(cur_aligned_u8, (3, 3), 0)
+
+        d = np.abs(cur2.astype(np.float32) - prev2.astype(np.float32))
+
+        p1, p99 = np.percentile(d, [1, 99.5])
+        if p99 <= p1:
+            return cur_aligned_u8
+
+        z = np.clip((d - p1) / (p99 - p1), 0, 1)
+        z = np.power(z, 0.5)
+        return (z * 255).astype(np.uint8)
+
+
     def show_frame(self, idx: int):
         idx = max(0, min(idx, len(self.frames) - 1))
         self.idx = idx
         item = self.frames[self.idx]
 
-        img = Image.open(item["png"])
+        use_reg = bool(self.reg_var and self.reg_var.get())
+        print("DEBUG use_reg =", use_reg, "idx =", idx)
+        if use_reg and idx > 0:
+            prev = self.load_png_gray(idx - 1)
+            cur = self.load_png_gray(idx)
+
+            cur_aligned, (dx, dy), resp = self._align_to_prev(prev, cur)
+
+            # If alignment failed / skipped, show plain cur instead of diff (prevents flashing)
+            h, w = cur.shape
+            max_shift = min(w, h) * 0.10  # same rule as _align_to_prev
+
+            if (resp < 0.2) or (abs(dx) > max_shift) or (abs(dy) > max_shift):
+                disp_u8 = cur  # show the current frame as-is
+            else:
+                disp_u8 = self._running_diff_display(prev, cur_aligned)
+
+            disp_u8 = self._running_diff_display(prev, cur_aligned)
+            print(f"DEBUG shift dx={dx:.2f} dy={dy:.2f} resp={resp:.3f}")
+            img = Image.fromarray(disp_u8)
+        else:
+            img = Image.open(item["png"])
+
         img = ImageOps.flip(img)  # vertical flip (top-bottom)
 
         # Fit-to-window preserving aspect ratio
@@ -767,33 +804,6 @@ class Viewer(tk.Toplevel):
                 fill="lightcyan", width=1, tags="grid"
             )
 
-    # def refine_centroid_from_png(self, x, y, half=20):
-    #     # x,y in original coords
-    #     path = self.frames[self.idx]["png"]
-    #     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    #     if img is None:
-    #         return x, y
-    #
-    #     h, w = img.shape
-    #     x0 = max(0, x - half);
-    #     x1 = min(w, x + half + 1)
-    #     y0 = max(0, y - half);
-    #     y1 = min(h, y + half + 1)
-    #     roi = img[y0:y1, x0:x1]
-    #
-    #     # Suppress noise and threshold
-    #     roi_blur = cv2.GaussianBlur(roi, (3, 3), 0)
-    #     _, mask = cv2.threshold(roi_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    #
-    #     m = cv2.moments(mask)
-    #     if m["m00"] == 0:
-    #         return x, y  # no blob found
-    #
-    #     cx = int(m["m10"] / m["m00"])
-    #     cy = int(m["m01"] / m["m00"])
-    #
-    #     return (x0 + cx, y0 + cy)
-
     def step(self, delta: int):
         self.show_frame(self.idx + delta)
 
@@ -823,8 +833,8 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description="CCOR-1 L1B date-range downloader + processor + viewer")
     ap.add_argument("--prefix", default=DEFAULT_PREFIX, help=f"S3 prefix (default: {DEFAULT_PREFIX})")
-    ap.add_argument("--start", required=True, help="UTC start datetime (e.g. '2026-01-15 06:00')")
-    ap.add_argument("--end", required=True, help="UTC end datetime (e.g. '2026-01-15 12:00')")
+    ap.add_argument("--start", required=True, help="UTC start datetime (e.g. '2026-01-15 00:00')")
+    ap.add_argument("--end", required=True, help="UTC end datetime (e.g. '2026-01-15 23:45')")
     ap.add_argument("--out", default="ccor1_session", help="Output folder")
     ap.add_argument("--mode", default="spatial", choices=["spatial", "temporal", "runningdiff", "none"],
                     help="Processing mode (spatial is best starting point for comet hunting)")
@@ -877,9 +887,10 @@ class JobGUI(tk.Tk):
         self.prefix = tk.StringVar(value=DEFAULT_PREFIX)
         self.out_dir = tk.StringVar(value=os.path.abspath("ccor1_session"))
         self.mode = tk.StringVar(value="spatial")
-        self.start_s = tk.StringVar(value="2026-01-15 06:00")
-        self.end_s = tk.StringVar(value="2026-01-15 09:00")
-        self.fps = tk.IntVar(value=10)
+        self.start_s = tk.StringVar(value="2026-01-15 00:00")
+        self.end_s = tk.StringVar(value="2026-01-15 23:45")
+        self.fps = tk.IntVar(value=5)
+        self.register_on_stars = tk.BooleanVar(value=False)
 
         self._confirm_var = tk.BooleanVar(value=False)
         self._confirm_ready = threading.Event()
@@ -941,8 +952,14 @@ class JobGUI(tk.Tk):
 
         row += 1
         ttk.Label(frm, text="Mode").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Combobox(frm, textvariable=self.mode, values=["spatial", "temporal", "runningdiff", "none"],
-                     state="readonly", width=26).grid(row=row, column=1, sticky="w", **pad)
+        ttk.Combobox(frm, textvariable=self.mode, values=MODES, state="readonly", width=12) \
+            .grid(row=row, column=1, sticky="w", **pad)
+
+        ttk.Checkbutton(
+            frm,
+            text="Register (stars)",
+            variable=self.register_on_stars
+        ).grid(row=row, column=2, sticky="w", padx=(12, 0), pady=6)
 
         row += 1
         ttk.Label(frm, text="FPS (viewer)").grid(row=row, column=0, sticky="w", **pad)
@@ -1017,7 +1034,12 @@ class JobGUI(tk.Tk):
                         continue
 
                     self._log("Launching viewer...")
-                    self.viewer = Viewer(self, manifest, fps_default=int(self.fps.get()))
+                    self.viewer = Viewer(
+                        self,
+                        manifest,
+                        fps_default=int(self.fps.get()),
+                        reg_var=self.register_on_stars
+                    )
 
         except queue.Empty:
             pass

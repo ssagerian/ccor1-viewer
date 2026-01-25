@@ -73,6 +73,157 @@ object tracking (e.g. comet candidates).
 7. Export tracked coordinates to CSV for further analysis
 
 ---
+## Mode-by-mode guidance
+### mode = none + registration ON
+
+Yes — this makes sense.
+
+What you get:
+
+Raw signal preserved
+
+Stars stop drifting
+
+Comets move smoothly across a stable star field
+
+Use this when:
+
+You want to visually track a faint dot
+
+You want accurate centroiding / tracking
+
+You’re inspecting shape (slightly extended blobs)
+
+This is your baseline “science” view.
+
+### ️ mode = spatial + registration ON
+
+Usually unnecessary, sometimes harmful.
+
+Why:
+
+Spatial high-pass already suppresses smooth background
+
+Registration adds interpolation noise
+
+Star residuals can get “ringy”
+
+When it might help:
+
+Very slow star drift
+
+Strong coronal gradient overwhelming faint objects
+
+Recommendation:
+
+Try without registration first
+
+If stars smear frame-to-frame, then enable registration
+
+### mode = temporal + registration ON
+
+Usually redundant.
+
+Why:
+
+Temporal median subtraction already removes static features (stars)
+
+Registration + temporal can over-subtract or create ghosts
+
+Typical symptom:
+
+Increased noise
+
+Patchy background
+
+Comet partially suppressed
+
+Recommendation:
+
+Use temporal WITHOUT registration
+
+Or use none + registration instead
+
+### mode = runningdiff + registration ON
+
+This one is subtle.
+
+What happens:
+
+Registration stabilizes stars
+
+Running difference then removes them almost completely
+
+Moving objects pop nicely
+
+BUT:
+
+Any registration error → high-frequency noise
+
+Phase correlation noise gets amplified
+
+You may see “sparkle” or grain
+
+When it does make sense:
+
+You have small, smooth drift
+
+You’re hunting very faint moving dots
+
+You accept a noisier image for detectability
+
+When it does not:
+
+When images are already clean
+
+When registration response (resp) is low (< ~0.3)
+
+When you want accurate centroiding
+
+---
+## Recommended workflow (this is the key)
+
+Think of modes as different passes, not one perfect view.
+
+### Step 1: Detect
+
+Use:
+
+runningdiff + registration ON
+
+or temporal + registration OFF
+
+Goal:
+
+Is there something moving at all?
+
+### Step 2: Inspect
+
+Switch to:
+
+none + registration ON
+
+Goal:
+
+Confirm it’s real
+
+Look at shape
+
+Click and track it
+
+### Step 3: Measure
+
+Stay in:
+
+none + registration ON
+
+Goal:
+
+Centroids
+
+Frame-to-frame motion
+
+CSV export
 
 ## Data Source
 
