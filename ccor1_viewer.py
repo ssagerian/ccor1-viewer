@@ -192,16 +192,12 @@ def read_ccor1_l1b_image(path: str):
 def apply_yawflip_if_needed(img: np.ndarray, hdr):
     yawflip = int(hdr.get("YAWFLIP", 0))
 
-    # If the product is already rectified, do NOT apply yawflip again.
-    rectified = bool(hdr.get("RECTIFY", False))
-    if rectified:
-        return img, yawflip
-
     # Otherwise apply based on state
     if yawflip == 2:  # INVERTED
         img = np.flipud(np.fliplr(img))  # 180° rotation
     # yawflip 0 upright: no-op
     # yawflip 1 neither: no-op + log (optional)
+    print(f"YAWFLIP={yawflip} ")
     return img, yawflip
 
 
