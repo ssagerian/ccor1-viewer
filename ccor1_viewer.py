@@ -169,36 +169,42 @@ def download_file(url: str, out_path: str, timeout: int = 120) -> None:
                     f.write(chunk)
         os.replace(tmp, out_path)
 
+def parse_obs_dt_from_header(hdr):
+    s = hdr.get("DATE-OBS") or hdr.get("DATE")
+    if not s:
+        return None
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-def read_ccor1_l1b_image(fits_path: str) -> Tuple[np.ndarray, dt.datetime]:
-    """
-    Returns float32 image (H,W) and DATE-OBS as UTC datetime.
-    CCOR-1 L1B images are in HDU 1 CompImageHDU (per your header).
-    """
-    with fits.open(fits_path) as hdul:
-        img = hdul[1].data
-        if img is None:
-            raise RuntimeError("No image data in HDU 1.")
-        img = np.asarray(img, dtype=np.float32)
 
+def read_ccor1_l1b_image(path: str):
+    with fits.open(path) as hdul:
+        img = hdul[1].data.astype(np.float32)
         hdr = hdul[1].header
-        date_obs = hdr.get("DATE-OBS")
-        if not date_obs:
-            # fallback: parse from filename
-            obs = parse_obs_dt_from_key(os.path.basename(fits_path))
-            if obs is None:
-                obs = dt.datetime.fromtimestamp(os.path.getmtime(fits_path), tz=dt.timezone.utc)
-        else:
-            # date_obs like: 2026-01-15T06:45:25.773
-            # strip fractional seconds if needed
-            ds = str(date_obs).split(".")[0]
-            obs = dt.datetime.strptime(ds, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc)
 
+    img, yawflip = apply_yawflip_if_needed(img, hdr)
+    obs = parse_obs_dt_from_header(hdr)
     return img, obs
 
 # ----------------------------
 # Processing modes (comet-friendly options)
 # ----------------------------
+
+def apply_yawflip_if_needed(img: np.ndarray, hdr):
+    yawflip = int(hdr.get("YAWFLIP", 0))
+
+    # If the product is already rectified, do NOT apply yawflip again.
+    rectified = bool(hdr.get("RECTIFY", False))
+    if rectified:
+        return img, yawflip
+
+    # Otherwise apply based on state
+    if yawflip == 2:  # INVERTED
+        img = np.flipud(np.fliplr(img))  # 180° rotation
+    # yawflip 0 upright: no-op
+    # yawflip 1 neither: no-op + log (optional)
+    return img, yawflip
+
+
 
 def enhance_stack_temporal_median(stack: np.ndarray, idx: int, window: int = 2) -> np.ndarray:
     """
@@ -616,7 +622,6 @@ class Viewer(tk.Toplevel):
         else:
             img = Image.open(item["png"])
 
-        img = ImageOps.flip(img)  # vertical flip (top-bottom)
 
         # Fit-to-window preserving aspect ratio
         cw = max(1, self.canvas.winfo_width())
@@ -675,7 +680,6 @@ class Viewer(tk.Toplevel):
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             return x, y, False
-        img = cv2.flip(img, 0)  # vertical flip to match display
 
         h, w = img.shape
         x0 = max(0, x - half);
