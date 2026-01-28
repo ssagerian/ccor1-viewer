@@ -27,7 +27,7 @@ S3_BASE = f"https://{BUCKET}.s3.amazonaws.com"
 
 # You can change this if NOAA moves folders. This is the only thing you may need to edit.
 # Start with the most likely L1B layout (time-based folders).
-DEFAULT_PREFIX = "SWFO/GOES-19/CCOR-1/ccor1-l2/"
+DEFAULT_PREFIX = "SWFO/GOES-19/CCOR-1/ccor1-l3/"
 
 TS_RE = re.compile(
     r"CCOR1_(?:[1-9]B?)_(\d{8}T\d{6})_.*\.fits$",
@@ -41,13 +41,80 @@ MODES = [
     "runningdiff",
 ]
 
-@dataclass
+import re
+import datetime as dt
+from dataclasses import dataclass
+from typing import List, Optional
+import requests
+
+SWPC_CCOR1_FITS_BASE = "https://services.swpc.noaa.gov/products/ccor1/fits"  # no trailing slash needed
+
 @dataclass
 class FitsItem:
     key: str
     url: str
-    obs_dt: dt.datetime
+    obs_dt: Optional[dt.datetime]
     size_bytes: int
+
+_ccor1_ts_re = re.compile(r"CCOR1_1B_(\d{8})T(\d{6})_V\d+_NC\.fits$", re.IGNORECASE)
+
+
+def _parse_dt_from_ccor1_name(fname: str) -> Optional[dt.datetime]:
+    m = _ccor1_ts_re.search(fname)
+    if not m:
+        return None
+    ymd = m.group(1)
+    hms = m.group(2)
+    # filename timestamps are UTC
+    return dt.datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=dt.timezone.utc)
+
+
+def list_swpc_ccor1_fits_in_range(start_utc: dt.datetime, end_utc: dt.datetime) -> List[FitsItem]:
+    """
+    Scrape the SWPC directory index once and filter by timestamp in filename.
+    Returns FitsItem list sorted by obs_dt.
+    """
+    if start_utc.tzinfo is None or end_utc.tzinfo is None:
+        raise ValueError("start_utc/end_utc must be timezone-aware (UTC).")
+
+    url = SWPC_CCOR1_FITS_BASE + "/"
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    html = r.text
+
+    # Apache index links look like: <a href="CCOR1_1B_20251215T000025_V00_NC.fits">...
+    # Sizes are shown in a separate column; we'll *best-effort* parse size like "8.6M"
+    link_re = re.compile(r'href="(CCOR1_1B_[^"]+?\.fits)"', re.IGNORECASE)
+    files = sorted(set(link_re.findall(html)))
+
+    def size_guess_from_row(fname: str) -> int:
+        # Very light heuristic: find the row containing the filename and parse "8.6M" / "123K" etc if present.
+        # If it fails, return 0 and your downloader still works.
+        # Example row (from the index): "CCOR1_...fits</a> 2025-12-15 00:20  8.6M"
+        row_re = re.compile(re.escape(fname) + r'.{0,120}?(\d+(?:\.\d+)?)\s*([KMG])', re.IGNORECASE)
+        m = row_re.search(html)
+        if not m:
+            return 0
+        val = float(m.group(1))
+        unit = m.group(2).upper()
+        mult = {"K": 1024, "M": 1024**2, "G": 1024**3}[unit]
+        return int(val * mult)
+
+    items: List[FitsItem] = []
+    for fname in files:
+        obs = _parse_dt_from_ccor1_name(fname)
+        if obs is None:
+            continue
+        if start_utc <= obs <= end_utc:
+            items.append(FitsItem(
+                key=fname,
+                url=f"{SWPC_CCOR1_FITS_BASE}/{fname}",
+                obs_dt=obs,
+                size_bytes=size_guess_from_row(fname),
+            ))
+
+    items.sort(key=lambda x: x.obs_dt or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+    return items
 
 
 def parse_obs_dt_from_key(key: str) -> Optional[dt.datetime]:
@@ -181,13 +248,45 @@ def read_ccor1_l1b_image(path: str):
         img = hdul[1].data.astype(np.float32)
         hdr = hdul[1].header
 
+    img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # yawflip: record/log only (no pixel ops here)
     img, yawflip = apply_yawflip_if_needed(img, hdr)
+
     obs = parse_obs_dt_from_header(hdr)
-    return img, obs
+    return img, obs, hdr
 
 # ----------------------------
 # Processing modes (comet-friendly options)
 # ----------------------------
+
+
+def wcs_make_north_up_vertical(img: np.ndarray, hdr) -> np.ndarray:
+    """
+    Ensure +image-Y points toward +SOLAR-Y (north).
+    If not, flip vertically. (Keeps it simple: just fixes the upside-down case.)
+    """
+    # Build a CD matrix from PC + CDELT (common FITS pattern)
+    cdelt1 = float(hdr.get("CDELT1", 1.0))
+    cdelt2 = float(hdr.get("CDELT2", 1.0))
+
+    pc11 = float(hdr.get("PC1_1", 1.0))
+    pc12 = float(hdr.get("PC1_2", 0.0))
+    pc21 = float(hdr.get("PC2_1", 0.0))
+    pc22 = float(hdr.get("PC2_2", 1.0))
+
+    # Pixel -> world linear part (approx; enough to determine axis direction)
+    # Column 2 corresponds to a +1 step in pixel Y.
+    d_world_dy_x = pc12 * cdelt2
+    d_world_dy_y = pc22 * cdelt2   # this corresponds to SOLAR-Y / HPLT direction
+
+    # If moving "down" in the image increases solar-y, the image is upside down.
+    # (Depending on convention, this sign check may be inverted; this is the test.)
+    if d_world_dy_y < 0:
+        return np.flipud(img)
+
+    return img
+
 
 def apply_yawflip_if_needed(img: np.ndarray, hdr):
     yawflip = int(hdr.get("YAWFLIP", 0))
@@ -288,7 +387,11 @@ def process_to_frames(
     obs_times = []
 
     for p in fits_paths:
-        img, obs = read_ccor1_l1b_image(p)
+        img, obs, hdr = read_ccor1_l1b_image(p)
+
+        # Apply orientation ONCE here
+        img = wcs_make_north_up_vertical(img, hdr)
+
         imgs.append(img)
         obs_times.append(obs)
 
@@ -389,7 +492,7 @@ class Viewer(tk.Toplevel):
         self.update_idletasks()
         self.show_frame(0)
 
-    def load_png_gray(self, frame_idx: int):
+    def load_png_gray(self, frame_idx: int) -> object:
         path = self.frames[frame_idx]["png"]
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
@@ -589,7 +692,6 @@ class Viewer(tk.Toplevel):
         z = np.power(z, 0.5)
         return (z * 255).astype(np.uint8)
 
-
     def show_frame(self, idx: int):
         idx = max(0, min(idx, len(self.frames) - 1))
         self.idx = idx
@@ -597,27 +699,28 @@ class Viewer(tk.Toplevel):
 
         use_reg = bool(self.reg_var and self.reg_var.get())
         print("DEBUG use_reg =", use_reg, "idx =", idx)
+
         if use_reg and idx > 0:
             prev = self.load_png_gray(idx - 1)
             cur = self.load_png_gray(idx)
 
             cur_aligned, (dx, dy), resp = self._align_to_prev(prev, cur)
 
-            # If alignment failed / skipped, show plain cur instead of diff (prevents flashing)
             h, w = cur.shape
-            max_shift = min(w, h) * 0.10  # same rule as _align_to_prev
+            max_shift = min(w, h) * 0.10
 
             if (resp < 0.2) or (abs(dx) > max_shift) or (abs(dy) > max_shift):
-                disp_u8 = cur  # show the current frame as-is
+                disp_u8 = cur
             else:
                 disp_u8 = self._running_diff_display(prev, cur_aligned)
 
-            disp_u8 = self._running_diff_display(prev, cur_aligned)
             print(f"DEBUG shift dx={dx:.2f} dy={dy:.2f} resp={resp:.3f}")
             img = Image.fromarray(disp_u8)
         else:
             img = Image.open(item["png"])
 
+        # If you move orientation fixes into process_to_frames(), remove this:
+        img = ImageOps.flip(img)
 
         # Fit-to-window preserving aspect ratio
         cw = max(1, self.canvas.winfo_width())
@@ -643,7 +746,7 @@ class Viewer(tk.Toplevel):
         self.draw_grid(step_pct=0.15)
 
         ts = item["date_obs_utc"]
-        self.info.config(text=f"{self.idx+1}/{len(self.frames)}   {ts}")
+        self.info.config(text=f"{self.idx + 1}/{len(self.frames)}   {ts}")
 
     def canvas_to_image_xy(self, cx: int, cy: int):
         """Map canvas coords to original PNG pixel coords (x,y). Returns None if outside image."""
@@ -829,54 +932,54 @@ class Viewer(tk.Toplevel):
 # ----------------------------
 # CLI entry
 # ----------------------------
-def main():
-    import argparse
-    ap = argparse.ArgumentParser(description="CCOR-1 L1B date-range downloader + processor + viewer")
-    ap.add_argument("--prefix", default=DEFAULT_PREFIX, help=f"S3 prefix (default: {DEFAULT_PREFIX})")
-    ap.add_argument("--start", required=True, help="UTC start datetime (e.g. '2026-01-15 00:00')")
-    ap.add_argument("--end", required=True, help="UTC end datetime (e.g. '2026-01-15 23:45')")
-    ap.add_argument("--out", default="ccor1_session", help="Output folder")
-    ap.add_argument("--mode", default="spatial", choices=["spatial", "temporal", "runningdiff", "none"],
-                    help="Processing mode (spatial is best starting point for comet hunting)")
-    ap.add_argument("--skip-download", action="store_true", help="Use already-downloaded FITS if present")
-    args = ap.parse_args()
-
-    start = utc_parse(args.start)
-    end = utc_parse(args.end)
-    if end < start:
-        raise SystemExit("end must be >= start")
-
-    session_dir = os.path.abspath(args.out)
-    raw_dir = os.path.join(session_dir, "raw")
-    frames_dir = os.path.join(session_dir, "frames_" + args.mode)
-
-    os.makedirs(raw_dir, exist_ok=True)
-    os.makedirs(frames_dir, exist_ok=True)
-
-    print(f"Listing objects under prefix: {args.prefix}")
-    items = find_fits_in_range(args.prefix, start, end)
-    print(f"Found {len(items)} FITS in range [{start.isoformat()} .. {end.isoformat()}].")
-    if not items:
-        print("\nNo items found.")
-        print("If you’re sure the time range is valid, the most likely issue is the prefix.")
-        print("Try changing --prefix to match the bucket’s actual L1B folder layout.")
-        return
-
-    fits_paths = []
-    for it in items:
-        local_name = os.path.basename(it.key)
-        out_path = os.path.join(raw_dir, local_name)
-        fits_paths.append(out_path)
-        if args.skip_download and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            continue
-        print(f"Downloading {local_name} ...")
-        download_file(it.url, out_path)
-
-    print(f"Processing {len(fits_paths)} frames -> {frames_dir} (mode={args.mode})")
-    manifest = process_to_frames(fits_paths, frames_dir, mode=args.mode, fps_hint=10)
-    print("Launching viewer...")
-    self.viewer = Viewer(self, payload["manifest"], fps_default=int(self.fps.get()))
-
+# def main():
+#     import argparse
+#     ap = argparse.ArgumentParser(description="CCOR-1 L1B date-range downloader + processor + viewer")
+#     ap.add_argument("--prefix", default=DEFAULT_PREFIX, help=f"S3 prefix (default: {DEFAULT_PREFIX})")
+#     ap.add_argument("--start", required=True, help="UTC start datetime (e.g. '2026-01-15 00:00')")
+#     ap.add_argument("--end", required=True, help="UTC end datetime (e.g. '2026-01-15 23:45')")
+#     ap.add_argument("--out", default="ccor1_session", help="Output folder")
+#     ap.add_argument("--mode", default="none", choices=["spatial", "temporal", "runningdiff", "none"],
+#                     help="Processing mode (spatial is best starting point for comet hunting)")
+#     ap.add_argument("--skip-download", action="store_true", help="Use already-downloaded FITS if present")
+#     args = ap.parse_args()
+#
+#     start = utc_parse(args.start)
+#     end = utc_parse(args.end)
+#     if end < start:
+#         raise SystemExit("end must be >= start")
+#
+#     session_dir = os.path.abspath(args.out)
+#     raw_dir = os.path.join(session_dir, "raw")
+#     frames_dir = os.path.join(session_dir, "frames_" + args.mode)
+#
+#     os.makedirs(raw_dir, exist_ok=True)
+#     os.makedirs(frames_dir, exist_ok=True)
+#
+#     print(f"Listing objects under prefix: {args.prefix}")
+#     items = find_fits_in_range(args.prefix, start, end)
+#     print(f"Found {len(items)} FITS in range [{start.isoformat()} .. {end.isoformat()}].")
+#     if not items:
+#         print("\nNo items found.")
+#         print("If you’re sure the time range is valid, the most likely issue is the prefix.")
+#         print("Try changing --prefix to match the bucket’s actual L1B folder layout.")
+#         return
+#
+#     fits_paths = []
+#     for it in items:
+#         local_name = os.path.basename(it.key)
+#         out_path = os.path.join(raw_dir, local_name)
+#         fits_paths.append(out_path)
+#         if args.skip_download and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+#             continue
+#         print(f"Downloading {local_name} ...")
+#         download_file(it.url, out_path)
+#
+#     print(f"Processing {len(fits_paths)} frames -> {frames_dir} (mode={args.mode})")
+#     manifest = process_to_frames(fits_paths, frames_dir, mode=args.mode, fps_hint=10)
+#     print("Launching viewer...")
+#     self.viewer = Viewer(self, payload["manifest"], fps_default=int(self.fps.get()))
+#
 
 class JobGUI(tk.Tk):
     def __init__(self):
@@ -886,12 +989,12 @@ class JobGUI(tk.Tk):
 
         self.prefix = tk.StringVar(value=DEFAULT_PREFIX)
         self.out_dir = tk.StringVar(value=os.path.abspath("ccor1_session"))
-        self.mode = tk.StringVar(value="spatial")
+        self.mode = tk.StringVar(value="none")
         self.start_s = tk.StringVar(value="2026-01-15 00:00")
         self.end_s = tk.StringVar(value="2026-01-15 23:45")
         self.fps = tk.IntVar(value=5)
         self.register_on_stars = tk.BooleanVar(value=False)
-
+        self.source = tk.StringVar(value="s3")
         self._confirm_var = tk.BooleanVar(value=False)
         self._confirm_ready = threading.Event()
 
@@ -900,6 +1003,13 @@ class JobGUI(tk.Tk):
 
         self._build_ui()
         self.after(100, self._poll_queue)
+
+    def _on_source_change(self):
+        src = self.source.get().lower()
+        if src == "swpc":
+            self.prefix_entry.configure(state="disabled")
+        else:
+            self.prefix_entry.configure(state="normal")
 
     def ask_proceed(self, count: int, total_mb: float) -> bool:
         msg = f"Found {count} files totaling {total_mb:.1f} MB.\n\nProceed with download?"
@@ -910,8 +1020,10 @@ class JobGUI(tk.Tk):
 
         frm = ttk.Frame(self)
         frm.pack(fill=tk.BOTH, expand=True, **pad)
-
         row = 0
+
+
+
         # ---- Start ----
         ttk.Label(frm, text="Start (UTC)").grid(row=row, column=0, sticky="w", **pad)
 
@@ -949,6 +1061,17 @@ class JobGUI(tk.Tk):
         ttk.Spinbox(frm, from_=0, to=59, textvariable=self.end_m, width=3, format="%02.0f").grid(row=row, column=1,
                                                                                               sticky="w",
                                                                                                 padx=(195, 2), pady=6)
+        row += 1
+        ttk.Label(frm, text="Source").grid(row=row, column=0, sticky="w", **pad)
+
+        self.source_cb = ttk.Combobox(
+            frm,
+            textvariable=self.source,
+            values=["s3", "swpc"],
+            width=12,
+            state="readonly"
+        )
+        self.source_cb.grid(row=row, column=1, sticky="w", **pad)
 
         row += 1
         ttk.Label(frm, text="Mode").grid(row=row, column=0, sticky="w", **pad)
@@ -966,8 +1089,11 @@ class JobGUI(tk.Tk):
         ttk.Spinbox(frm, from_=1, to=60, textvariable=self.fps, width=7).grid(row=row, column=1, sticky="w", **pad)
 
         row += 1
+
         ttk.Label(frm, text="S3 Prefix").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm, textvariable=self.prefix, width=58).grid(row=row, column=1, sticky="w", **pad)
+
+        self.prefix_entry = ttk.Entry(frm, textvariable=self.prefix, width=58)
+        self.prefix_entry.grid(row=row, column=1, sticky="w", **pad)
 
         row += 1
         ttk.Label(frm, text="Output Folder").grid(row=row, column=0, sticky="w", **pad)
@@ -988,6 +1114,7 @@ class JobGUI(tk.Tk):
 
         frm.grid_columnconfigure(1, weight=1)
         frm.grid_rowconfigure(row, weight=1)
+       # self._on_source_change()
 
         self._log("Ready. Enter a UTC start/end and click Start.")
 
@@ -1066,6 +1193,8 @@ class JobGUI(tk.Tk):
         self.start_btn.config(state="disabled")
         self.pb.start(10)
 
+        source = self.source.get().strip().lower()
+
         args = {
             "prefix": self.prefix.get().strip(),
             "out_dir": os.path.abspath(self.out_dir.get().strip()),
@@ -1073,6 +1202,7 @@ class JobGUI(tk.Tk):
             "start": start,
             "end": end,
             "fps": int(self.fps.get()),
+            "source": source,
         }
 
         self._worker = threading.Thread(target=self._run_job, args=(args,), daemon=True)
@@ -1085,9 +1215,17 @@ class JobGUI(tk.Tk):
             frames_dir = os.path.join(session_dir, "frames_" + args["mode"])
             os.makedirs(raw_dir, exist_ok=True)
             os.makedirs(frames_dir, exist_ok=True)
+            start_utc = args["start"]
+            end_utc = args["end"]
+            source = args["source"].lower()
 
-            self._queue.put(("log", f"Listing: prefix={args['prefix']}"))
-            items = find_fits_in_range(args["prefix"], args["start"], args["end"])
+            if source == "swpc":
+                items = list_swpc_ccor1_fits_in_range(start_utc, end_utc)
+            else:
+                items = find_fits_in_range(prefix=args["prefix"], start_utc=start_utc, end_utc=end_utc)
+
+            self._queue.put(("log", f"Listing: from source={source}"))
+
             if not items:
                 self._queue.put(("log", "Found 0 FITS in range. Nothing to download."))
                 self._queue.put(("done", {"canceled": True}))
@@ -1107,12 +1245,6 @@ class JobGUI(tk.Tk):
                 return
 
             self._queue.put(("log", f"Found {len(items)} FITS in range."))
-
-            if not items:
-                raise RuntimeError(
-                    "Found 0 FITS. Most likely the S3 prefix is wrong for L1B.\n"
-                    "Try a different prefix under SWFO/GOES-19/CCOR-1/ that contains CCOR1_1B_*.fits files."
-                )
 
             fits_paths = []
             for n, it in enumerate(items, start=1):
