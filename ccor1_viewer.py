@@ -300,31 +300,49 @@ def apply_yawflip_if_needed(img: np.ndarray, hdr):
     return img, yawflip
 
 
-
 def enhance_stack_temporal_median(stack: np.ndarray, idx: int, window: int = 2) -> np.ndarray:
     """
-    Your original idea: temporal median background subtraction (good for CMEs; mixed for comets).
-    Returns float image >=0
+    Temporal median background subtraction + band-pass for small slightly-extended blobs.
+    Returns float32 image >= 0.
     """
     start = max(0, idx - window)
     end = min(stack.shape[0], idx + window + 1)
-    bg = np.median(stack[start:end], axis=0)
-    diff = stack[idx] - bg
-    diff = np.clip(diff, 0, None)
-    return diff
+
+    cur = stack[idx].astype(np.float32)
+    bg = np.median(stack[start:end], axis=0).astype(np.float32)
+
+    resid = cur - bg
+    resid = np.clip(resid, 0, None)
+
+    # --- Band-pass (Difference of Gaussians) ---
+    # small blur: suppress pixel noise
+    g1 = cv2.GaussianBlur(resid, (0, 0), 1.2)
+    # larger blur: suppress broader structures + star halos
+    g2 = cv2.GaussianBlur(resid, (0, 0), 3.0)
+
+    dog = g1 - g2
+    dog = np.clip(dog, 0, None)
+
+    # Optional: a touch more smoothing to stabilize thresholding
+    dog = cv2.GaussianBlur(dog, (0, 0), 0.8)
+
+    return dog
 
 
 def enhance_spatial_highpass(img: np.ndarray, sigma: float = 50.0) -> np.ndarray:
-    """
-    Better for point-like faint objects: subtract a heavily blurred background.
-    """
-    # OpenCV expects float32
-    blur = cv2.GaussianBlur(img.astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
-    hp = img - blur
-    # Keep both signs? For comet hunting, positive usually enough; but keep a little symmetric by shifting:
-    # We'll keep positives but you can change this.
-    hp = np.clip(hp, 0, None)
-    return hp
+    x = img.astype(np.float32)
+
+    pre = cv2.GaussianBlur(x, (0, 0), 1.2)
+    bg  = cv2.GaussianBlur(pre, (0, 0), sigma)
+    hp  = pre - bg
+    hp  = np.clip(hp, 0, None)
+
+    # NEW: remove broad residual structures (often rings/arcs)
+    resid = cv2.GaussianBlur(hp, (0, 0), 120.0)  # try 100–140
+    hp2 = hp - resid
+    hp2 = np.clip(hp2, 0, None)
+
+    return hp2
 
 
 def stretch_to_uint8(img: np.ndarray, p_low: float = 1.0, p_high: float = 99.0, gamma: float = 0.6) -> np.ndarray:
